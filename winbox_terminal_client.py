@@ -19,13 +19,18 @@ import socket
 import secrets
 import struct
 import hashlib
+import hmac
 import argparse
 import sys
 import os
 import select
 import time
-import tty
-import termios
+try:
+    import tty
+    import termios
+except ImportError:
+    tty = None
+    termios = None
 
 from Crypto.Cipher import AES
 from Crypto.Hash import HMAC, SHA1, SHA256
@@ -571,17 +576,20 @@ class WinboxTerminalClient:
             self.socket.close()
             self.socket = None
 
-    def authenticate(self, username, password):
+    def authenticate(self, username, password, modern_only=False):
         """Authenticate to the router.
 
         Tries EC-SRP5 (RouterOS >= 6.43) first. If the server doesn't respond
         to the EC-SRP5 init (old RouterOS), reconnects and falls back to the
-        old MD5 challenge-response over unencrypted M2.
+        old MD5 challenge-response over unencrypted M2. modern_only refuses
+        that fallback: the old session is not encrypted.
         """
         try:
             self._ec_srp5_authenticate(username, password)
         except ConnectionError_ as e:
             err_msg = str(e)
+            if modern_only:
+                raise
             if "does not support EC-SRP5" in err_msg or "No response" in err_msg:
                 # Old RouterOS — reconnect and try old auth
                 sys.stderr.write("EC-SRP5 not supported, trying old auth...\n")
@@ -1002,23 +1010,21 @@ class WinboxTerminalClient:
         aes = AES.new(self.receive_aes_key, AES.MODE_CBC, iv)
         decrypted = aes.decrypt(encrypted)
 
-        # Remove padding
-        if decrypted[-1] != 0:
-            try:
-                decrypted = unpad(decrypted, AES.block_size)
-            except ValueError:
-                return None
-        decrypted = decrypted[:-1]  # strip pad indicator byte
-
-        # Verify HMAC and strip
-        if len(decrypted) < 20:
+        # Same padding the sender writes: N+1 bytes of value N, N = 15 - (len % 16).
+        pad_byte = decrypted[-1]
+        pad_len = pad_byte + 1
+        if pad_len < 1 or pad_len > 16 or len(decrypted) < pad_len + 20:
             return None
+        if decrypted[-pad_len:] != bytes([pad_byte]) * pad_len:
+            return None
+        decrypted = decrypted[:-pad_len]
+
         hmc = decrypted[-20:]
         decrypted = decrypted[:-20]
-
         hmac_obj = HMAC.new(self.receive_hmac_key, b'', SHA1)
         hmac_obj.update(decrypted)
-        # Skip HMAC verification failure — some messages may still be usable
+        if not hmac.compare_digest(hmac_obj.digest(), hmc):
+            return None
 
         return decrypted
 
@@ -1173,6 +1179,44 @@ class WinboxTerminalClient:
             self.send_ack()
         return output
 
+    def fetch_caller(self, timeout=6):
+        """Read-only. Prints nothing and changes nothing on the router.
+
+        Asks the two tables that carry the address we show as Caller / Endpoint.
+        """
+        import re
+        self.send_ready_signal()
+        self._read_terminal(1.5)
+        commands = (
+            b'/ppp active print terse without-paging\r',
+            b'/interface wireguard peers print terse without-paging\r',
+        )
+        buf = b''
+        for cmd in commands:
+            self.send_terminal_input(cmd)
+            buf += self._read_terminal(timeout)
+        text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', buf.decode('utf-8', 'replace'))
+        patterns = (
+            r'current-endpoint-address=("?)(\d{1,3}(?:\.\d{1,3}){3})',
+            r'(?<![\w-])endpoint-address=("?)(\d{1,3}(?:\.\d{1,3}){3})',
+            r'caller-id=("?)(\d{1,3}(?:\.\d{1,3}){3})',
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                ip = match.group(2)
+                if _public_ip(ip):
+                    return ip
+        return ''
+
+    def _read_terminal(self, seconds):
+        end = time.time() + seconds
+        buf = b''
+        while time.time() < end:
+            chunk = self.receive_terminal_output(timeout=0.25)
+            if chunk:
+                buf += chunk
+        return buf
+
     def dump_initial_output(self, duration=5):
         """Read and print terminal output for a fixed duration (non-interactive)."""
         self.socket.setblocking(False)
@@ -1205,8 +1249,8 @@ class WinboxTerminalClient:
 
     def interactive_loop(self):
         """Run interactive terminal I/O loop. Requires a real TTY on stdin."""
-        if not os.isatty(sys.stdin.fileno()):
-            raise RuntimeError("interactive_loop requires a TTY (use --dump for non-interactive mode)")
+        if not os.isatty(sys.stdin.fileno()) or tty is None or termios is None:
+            raise RuntimeError("interactive_loop requires a TTY (use --dump or --caller)")
 
         self.socket.settimeout(0)
         self.socket.setblocking(False)
@@ -1290,6 +1334,24 @@ class WinboxTerminalClient:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
 
 
+def _public_ip(ip):
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return False
+    if any(n < 0 or n > 255 for n in nums):
+        return False
+    a, b = nums[0], nums[1]
+    if a in (0, 10, 127) or (a == 192 and b == 168) or (a == 169 and b == 254):
+        return False
+    if a == 172 and 16 <= b <= 31:
+        return False
+    return True
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1311,6 +1373,7 @@ def main():
     parser.add_argument('--cols', type=int, default=80, help='Terminal columns (default: 80)')
     parser.add_argument('--rows', type=int, default=24, help='Terminal rows (default: 24)')
     parser.add_argument('--dump', action='store_true', help='Non-interactive: dump initial output and exit')
+    parser.add_argument('--caller', action='store_true', help='Read-only: print the public caller or endpoint address and exit')
     parser.add_argument('--dump-time', type=int, default=5, help='Seconds to read output in dump mode (default: 5)')
 
     args = parser.parse_args()
@@ -1331,20 +1394,33 @@ def main():
             sys.stderr.write(f"Invalid port: {parts[1]}\n")
             return 1
 
+    if not args.password:
+        args.password = os.environ.get('WINBOX_PASSWORD', '')
+
     client = WinboxTerminalClient(host, port)
 
     try:
-        sys.stderr.write(f"Connecting to {host}:{port}...\n")
+        if not args.caller:
+            sys.stderr.write(f"Connecting to {host}:{port}...\n")
         client.connect()
-        sys.stderr.write("Connected. Authenticating...\n")
-        client.authenticate(args.username, args.password)
-        sys.stderr.write("Authenticated. Opening terminal...\n")
+        if not args.caller:
+            sys.stderr.write("Connected. Authenticating...\n")
+        client.authenticate(args.username, args.password, modern_only=args.caller)
+        if not args.caller:
+            sys.stderr.write("Authenticated. Opening terminal...\n")
 
         if not client.open_terminal(args.password, args.cols, args.rows):
             sys.stderr.write("Failed to open terminal session.\n")
             return 1
 
-        sys.stderr.write(f"Terminal session opened (session_id={client.session_id}).\n")
+        if args.caller:
+            ip = client.fetch_caller()
+            if ip:
+                sys.stdout.write(ip + "\n")
+            return 0
+
+        if not args.caller:
+            sys.stderr.write(f"Terminal session opened (session_id={client.session_id}).\n")
 
         if args.dump or not os.isatty(sys.stdin.fileno()):
             client.dump_initial_output(args.dump_time)
